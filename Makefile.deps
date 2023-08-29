@@ -1,0 +1,29 @@
+MUSL_PATH := $(ROOT_DIR)/musl
+TOOLCHAIN_PATH := $(ROOT_DIR)/.toolchain
+MUSL_GCC := $(TOOLCHAIN_PATH)/bin/musl-gcc
+
+MBEDTLS_PATH := $(ROOT_DIR)/mbedtls
+MBEDTLS_BUILD := $(MBEDTLS_PATH)/build
+
+# Musl toolchain
+$(TOOLCHAIN_PATH):
+	cd $(MUSL_PATH) && ./configure \
+		--prefix=$(TOOLCHAIN_PATH) \
+		--syslibdir=$(TOOLCHAIN_PATH)/lib
+	$(MAKE) -C $(MUSL_PATH)
+	$(MAKE) -C $(MUSL_PATH) install
+
+$(MBEDTLS_BUILD): $(TOOLCHAIN_PATH)
+# Install mbedtls build deps
+	$(PIP) install -r $(MBEDTLS_PATH)/scripts/basic.requirements.txt
+# Prepare the build
+# 1. Force all executables to be statically linked
+# 2. Disable tests
+	mkdir -p $(MBEDTLS_BUILD)
+	CC="$(MUSL_GCC)" $(CMAKE) \
+		-DCMAKE_EXE_LINKER_FLAGS="-static" \
+		-DCMAKE_FIND_LIBRARY_SUFFIXES=".a" \
+		-DENABLE_TESTING=Off \
+		-B $(MBEDTLS_BUILD) -S mbedtls
+# Build it
+	$(MAKE) -C $(MBEDTLS_BUILD)
