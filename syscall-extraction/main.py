@@ -13,4 +13,4 @@ import extractor
 
 # Start extracting!
 log.info("Extractor loaded. Extracting...")
-extractor.extract(args.executable_file)
+extractor.extract_scg(args.executable_file)
