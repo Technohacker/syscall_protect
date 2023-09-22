@@ -1,2 +1,3 @@
 angr
 loguru
+pygraphviz

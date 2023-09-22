@@ -7,7 +7,7 @@ from pprint import pprint
 
 import networkx
 
-def extract_scg(file_path):
+def extract_cfg(file_path: str) -> angr.analyses.cfg.CFGFast:
     # Load the project and TODO: all debug symbols associated
     log.info("Loading project...")
     proj = angr.Project(file_path, load_options={"auto_load_libs": False}, load_debug_info = False)
@@ -16,10 +16,9 @@ def extract_scg(file_path):
 
     # Extract the control flow graph (CFG)
     log.info("Extracting CFG, this may take a while...")
-    cfg: angr.analyses.cfg.CFGEmulated = proj.analyses.CFGEmulated(
-        context_sensitivity_level=1,
-        enable_function_hints=True,
+    cfg: angr.analyses.cfg.CFGFast = proj.analyses.CFGFast(
         normalize=True,
+        show_progressbar=True,
     )
     log.info("CFG Extracted")
 
@@ -28,27 +27,80 @@ def extract_scg(file_path):
     # cfg.make_functions()
     # log.info("Function instances re-constructed")
 
-    log.info(f"# of functions present: {len(cfg.functions)}")
+    return cfg
 
-    # Build the syscall graph from the CFG
-    # Start traversal from the binary's entry point
-    entry_nodes = cfg.model.get_all_nodes(proj.entry)
-    assert len(entry_nodes) == 1, "Binary entry point had multiple contexts!"
+def extract_scg(cfg: angr.analyses.cfg.CFGFast) -> networkx.DiGraph:
+    G = cfg.graph
 
-    queue = collections.deque([entry_nodes[0]])
-    visited = set()
-    while len(queue) > 0:
-        node = queue.popleft()
-        if node in visited:
+    log.info(f"# of nodes present: {len(G.nodes())}")
+
+    # Point Syscall edges to the immediate next fallthrough node (if present)
+    log.info(f"Redirecting syscall edges...")
+    for node in G.nodes():
+        edges = list(G.out_edges(node, data=True))
+        edge_count = len(edges)
+
+        for i in range(edge_count):
+            # Skip any non-syscall edges
+            (_, syscall_node, syscall_data) = edges[i]
+            if syscall_data["jumpkind"] != "Ijk_Sys_syscall":
+                continue
+
+            # We're at the end of this node's edges, there are no more fakerets
+            if i == edge_count - 1:
+                continue
+
+            (_, fallthrough_node, fallthrough_data) = edges[i + 1]
+            if fallthrough_data["jumpkind"] != "Ijk_FakeRet":
+                continue
+
+            # Make sure we don't accidentally clobber more fakerets by changing the jumpkind
+            syscall_data["jumpkind"] = f"Syscall: {syscall_node.name}"
+            G.remove_edge(node, syscall_node)
+            networkx.set_edge_attributes(G, {
+                (node, fallthrough_node): syscall_data
+            })
+
+    # Build partitions of the CFG based on connected boring nodes
+    log.info(f"Building partitions...")
+    partitions = []
+    covered = set()
+    for node in G.nodes():
+        if node in covered:
             continue
+        
+        # Find all nodes reachable from this node with boring edges
+        queue: collections.deque[angr.analyses.cfg.CFGNode] = collections.deque([node])
+        partition = set()
+        while len(queue) > 0:
+            n = queue.popleft()
+            if n in covered or n in partition:
+                continue
 
-        visited.add(node)
-        print(f"\n[{node.addr:x}] {node.name}")
+            partition.add(n)
+            covered.add(n)
 
-        # Don't skip the fake returns, since those actually tell us where syscalls return
-        for (succ, jmp) in node.successors_and_jumpkinds(excluding_fakeret=False):
-            print(f"\t{jmp} to [{succ.addr:x}] {succ.name}")
-            if succ not in visited:
-                queue.append(succ)
+            for (_, v, data) in G.out_edges(n, data=True):
+                if data["jumpkind"] in ["Ijk_Boring", "Ijk_FakeRet"]:
+                    queue.append(v)
 
-    return proj
+        partitions.append(partition)
+
+    log.info(f"Partitions built, # of nodes expected in SCG: {len(partitions)}")
+
+    # Build the SCG by using quotient graphs
+    log.info(f"Building SCG, this may take a while...")
+    scg = networkx.quotient_graph(
+        G,
+        partitions,
+        edge_relation=lambda a, b: len(networkx.node_boundary(G, a, b)) > 0,
+        edge_data=lambda a, b: {
+            "label": G.get_edge_data(*(list(networkx.edge_boundary(G, a, b))[0]))["jumpkind"],
+        },
+        node_data=lambda partition: {
+            "label": list(partition)[0].name,
+        },
+    )
+    log.info(f"SCG built, # of nodes: {len(scg.nodes())}. # of edges: {len(scg.edges())}")
+
+    return scg
