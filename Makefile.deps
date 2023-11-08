@@ -5,6 +5,10 @@ MUSL_GCC := $(TOOLCHAIN_PATH)/bin/musl-gcc
 MBEDTLS_PATH := $(ROOT_DIR)/mbedtls
 MBEDTLS_BUILD := $(MBEDTLS_PATH)/build
 
+KERNEL_PATH := $(ROOT_DIR)/kernel
+KERNEL_CONFIG_PATH := $(ROOT_DIR)/kernel_rust_config
+KERNEL := $(KERNEL_PATH)/arch/x86_64/boot/bzImage
+
 # Musl toolchain
 $(TOOLCHAIN_PATH):
 	cd $(MUSL_PATH) && ./configure \
@@ -27,3 +31,10 @@ $(MBEDTLS_BUILD): $(TOOLCHAIN_PATH)
 		-B $(MBEDTLS_BUILD) -S mbedtls
 # Build it
 	$(MAKE) -C $(MBEDTLS_BUILD)
+
+$(KERNEL_CONFIG_PATH):
+	cp $(KERNEL_CONFIG_PATH) $(KERNEL_PATH)/.config
+	cd $(KERNEL_PATH) && $(MAKE) LLVM=1 olddefconfig rust-analyzer
+
+$(KERNEL): $(KERNEL_PATH) $(KERNEL_CONFIG_PATH)
+	cd $(KERNEL_PATH) && $(MAKE) LLVM=1

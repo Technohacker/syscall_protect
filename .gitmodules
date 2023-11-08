@@ -4,3 +4,6 @@
 [submodule "musl"]
 	path = musl
 	url = git://git.musl-libc.org/musl
+[submodule "kernel"]
+	path = kernel
+	url = https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git

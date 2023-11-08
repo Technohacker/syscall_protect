@@ -1,0 +1,6 @@
+{
+    "rust-analyzer.linkedProjects": [
+        "kernel/rust-project.json",
+        "syscall_protect_kmod/rust-project.json"
+    ]
+}
