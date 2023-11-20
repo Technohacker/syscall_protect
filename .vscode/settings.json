@@ -1,6 +1,7 @@
 {
     "rust-analyzer.linkedProjects": [
         "kernel/rust-project.json",
-        "syscall_protect_kmod/rust-project.json"
+        "syscall_protect/Cargo.toml",
+        "syscall_protect_kmod/rust-project.json",
     ]
 }
