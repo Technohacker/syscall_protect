@@ -1,0 +1,263 @@
+diff --git a/include/linux/seccomp.h b/include/linux/seccomp.h
+index 175079552..04499ed2c 100644
+--- a/include/linux/seccomp.h
++++ b/include/linux/seccomp.h
+@@ -38,6 +38,8 @@ struct seccomp {
+ 	int mode;
+ 	atomic_t filter_count;
+ 	struct seccomp_filter *filter;
++	void *context;
++	bool (*callback)(void *context, int syscall_number);
+ };
+ 
+ #ifdef CONFIG_HAVE_ARCH_SECCOMP_FILTER
+diff --git a/kernel/seccomp.c b/kernel/seccomp.c
+index 255999ba9..a79e6b58d 100644
+--- a/kernel/seccomp.c
++++ b/kernel/seccomp.c
+@@ -1346,6 +1346,19 @@ int __secure_computing(const struct seccomp_data *sd)
+ 	this_syscall = sd ? sd->nr :
+ 		syscall_get_nr(current, current_pt_regs());
+ 
++	if (current->seccomp.callback) {
++		bool allowed = (*current->seccomp.callback)(current->seccomp.context, this_syscall);
++
++		if (!allowed) {
++			current->seccomp.mode = SECCOMP_MODE_DEAD;
++			seccomp_log(this_syscall, SIGKILL, SECCOMP_RET_KILL_THREAD, true);
++			do_exit(SIGKILL);
++			return -1;
++		}
++
++		return 0;
++	}
++
+ 	switch (mode) {
+ 	case SECCOMP_MODE_STRICT:
+ 		__secure_computing_strict(this_syscall);  /* may call do_exit */
+diff --git a/rust/bindings/bindings_helper.h b/rust/bindings/bindings_helper.h
+index 85f013ed4..052c6946d 100644
+--- a/rust/bindings/bindings_helper.h
++++ b/rust/bindings/bindings_helper.h
+@@ -8,6 +8,7 @@
+ 
+ #include <kunit/test.h>
+ #include <linux/errname.h>
++#include <linux/proc_fs.h>
+ #include <linux/slab.h>
+ #include <linux/refcount.h>
+ #include <linux/wait.h>
+diff --git a/rust/kernel/lib.rs b/rust/kernel/lib.rs
+index e6aff80b5..b0ec02f7a 100644
+--- a/rust/kernel/lib.rs
++++ b/rust/kernel/lib.rs
+@@ -39,7 +39,9 @@
+ #[cfg(CONFIG_KUNIT)]
+ pub mod kunit;
+ pub mod prelude;
++pub mod procfs;
+ pub mod print;
++pub mod seccomp;
+ mod static_assert;
+ #[doc(hidden)]
+ pub mod std_vendor;
+diff --git a/rust/kernel/procfs.rs b/rust/kernel/procfs.rs
+new file mode 100644
+index 000000000..dfed0a2fb
+--- /dev/null
++++ b/rust/kernel/procfs.rs
+@@ -0,0 +1,124 @@
++//! Procfs bindings
++
++use core::marker::PhantomPinned;
++
++use bindings::proc_dir_entry;
++use kernel::prelude::*;
++
++/// A folder in procfs
++pub struct ProcDirectory(*mut proc_dir_entry);
++
++impl ProcDirectory {
++    /// Create a new procfs folder
++    pub fn new(name: &CStr, parent: Option<&ProcDirectory>) -> Self {
++        Self(unsafe {
++            bindings::proc_mkdir(
++                name.as_char_ptr(),
++                parent.map(|x| x.0).unwrap_or_else(|| core::ptr::null_mut()),
++            )
++        })
++    }
++}
++
++impl Drop for ProcDirectory {
++    fn drop(&mut self) {
++        unsafe { bindings::proc_remove(self.0) }
++    }
++}
++
++/// A file in procfs
++#[derive(Debug)]
++pub struct ProcFile {
++    entry: *mut proc_dir_entry,
++
++    write_handler: Option<WriteHandler>,
++
++    _pin: PhantomPinned,
++}
++
++type WriteHandler = fn(&[u8]) -> Option<Error>;
++
++impl ProcFile {
++    /// Create a new procfs file
++    pub fn new(name: &CStr, parent: Option<&ProcDirectory>) -> Pin<Box<Self>> {
++        let file = Box::try_new(Self {
++            entry: core::ptr::null_mut(),
++
++            write_handler: None,
++
++            _pin: PhantomPinned,
++        })
++        .expect("OOM?");
++        let mut file = Box::into_pin(file);
++
++        unsafe {
++            let file_ptr = file.as_mut().get_unchecked_mut();
++
++            file_ptr.entry = bindings::proc_create_data(
++                name.as_char_ptr(),
++                0o755,
++                parent.map(|x| x.0).unwrap_or_else(core::ptr::null_mut),
++                &RUST_PROC_OPS,
++                (file_ptr as *mut ProcFile).cast(),
++            )
++        };
++
++        file
++    }
++
++    /// Use the provided rust function for handling writes
++    pub fn with_write(mut self: Pin<Box<Self>>, write_handler: WriteHandler) -> Pin<Box<Self>> {
++        let self_ptr = unsafe { self.as_mut().get_unchecked_mut() };
++        self_ptr.write_handler = Some(write_handler);
++
++        self
++    }
++}
++
++impl Drop for ProcFile {
++    fn drop(&mut self) {
++        unsafe {
++            bindings::proc_remove(self.entry);
++        }
++    }
++}
++
++const RUST_PROC_OPS: bindings::proc_ops = bindings::proc_ops {
++    proc_flags: 0,
++    proc_open: None,
++    proc_read: None,
++    proc_read_iter: None,
++    proc_write: Some(proc_write),
++    proc_lseek: None,
++    proc_release: None,
++    proc_poll: None,
++    proc_ioctl: None,
++    proc_mmap: None,
++    proc_get_unmapped_area: None,
++};
++
++unsafe extern "C" fn proc_write(
++    file: *mut bindings::file,
++    buffer: *const i8,
++    count: usize,
++    _offset: *mut i64,
++) -> isize {
++    let proc_file = unsafe { &*((*(*file).f_inode).i_private as *const ProcFile) as &ProcFile };
++
++    if let Some(handler) = proc_file.write_handler {
++        let mut buf: Vec<u8> = Vec::try_with_capacity(count).expect("OOM?");
++
++        unsafe {
++            bindings::_copy_from_user(buf.as_mut_ptr().cast(), buffer.cast(), count as u64);
++            buf.set_len(count);
++        }
++
++        if let Some(error) = handler(&buf[..]) {
++            error.to_errno() as isize
++        } else {
++            count as isize
++        }
++    } else {
++        EIO.to_errno() as isize
++    }
++}
+diff --git a/rust/kernel/seccomp.rs b/rust/kernel/seccomp.rs
+new file mode 100644
+index 000000000..eca113d0b
+--- /dev/null
++++ b/rust/kernel/seccomp.rs
+@@ -0,0 +1,64 @@
++//! SECure COMPuting wrappers
++//!
++//! Only provides a custom callback-based model for this project
++
++use core::ffi::c_void;
++
++use kernel::prelude::*;
++
++use crate::{task::Task, types::ForeignOwnable};
++
++struct RustSeccompCallback<T> {
++    callback: fn(&mut T, i32) -> bool,
++    context: Box<T>,
++}
++
++impl Task {
++    unsafe extern "C" fn rust_seccomp_callback(context: *mut c_void, syscall_number: i32) -> bool {
++        let rust_ctx = unsafe {
++            &mut *(context.cast() as *mut RustSeccompCallback<()>)
++        };
++
++        let is_exit = matches!(syscall_number as u32, bindings::__NR_exit | bindings::__NR_exit_group);
++        let allowed = is_exit || (rust_ctx.callback)(&mut rust_ctx.context, syscall_number);
++
++        let should_cleanup = is_exit || !allowed;
++
++        if should_cleanup {
++            let task: &Task = kernel::current!();
++            task.unregister_seccomp_callback();
++        }
++
++        allowed
++    }
++
++    /// Registers a seccomp callback on this task
++    pub fn register_seccomp_callback<T: 'static>(&self, context: T, callback: fn(&mut T, i32) -> bool) {
++        let task = unsafe { &mut *self.0.get() };
++        let rust_ctx = Box::try_new(RustSeccompCallback {
++            callback,
++            context: Box::try_new(context).expect("OOM?"),
++        })
++        .expect("OOM?")
++        .into_foreign();
++
++        task.seccomp.context = rust_ctx.cast_mut();
++        task.seccomp.callback = Some(Task::rust_seccomp_callback);
++
++        // thread_info.h
++        const SYSCALL_WORK_BIT_SECCOMP: usize = 0;
++        task.thread_info.syscall_work |= 1 << SYSCALL_WORK_BIT_SECCOMP;
++    }
++
++    /// Unregisters a seccomp callback on this task
++    pub fn unregister_seccomp_callback(&self) {
++        let task = unsafe { &mut *self.0.get() };
++
++        if task.seccomp.callback.is_some() {
++            task.seccomp.callback = None;
++
++            let context = unsafe { Box::from_raw((*task).seccomp.context) };
++            drop(context);
++        }
++    }
++}
