@@ -109,17 +109,35 @@ def extract_scg(cfg: angr.analyses.cfg.CFGFast) -> networkx.DiGraph:
 
         partitions.append(partition)
 
+    # Freeze each set to make them hashable
+    partitions = [frozenset(x) for x in partitions]
     log.info(f"Partitions built, # of nodes expected in SCG: {len(partitions)}")
 
-    # Build the SCG by using quotient graphs
+    log.info(f"Building partition boundaries...")
+    # Cache each partition's connecting points to speed up quotient graph building
+    partition_boundaries = {}
+    for part in partitions:
+        boundary = []
+        for node in part:
+            # boundary.append(node)
+
+            for (_, _, edge_data) in itertools.chain(G.in_edges(node, data=True), G.out_edges(node, data=True)):
+                if edge_data["jumpkind"] in ["Ijk_Call", "Ijk_Ret", "Syscall"]:
+                    boundary.append(node)
+                    break
+
+        partition_boundaries[part] = boundary
+    log.info(f"Partition boundaries ready")
+    
+    # Then build the SCG by using quotient graphs
     log.info(f"Building SCG, this may take a while...")
     def should_edge_exist(a, b):
-        node_boundary = networkx.node_boundary(G, a, b)
+        node_boundary = networkx.node_boundary(G, partition_boundaries[a], partition_boundaries[b])
 
         return len(node_boundary) > 0
 
     def edge_data(a, b):
-        boundary = list(networkx.edge_boundary(G, a, b))
+        boundary = list(networkx.edge_boundary(G, partition_boundaries[a], partition_boundaries[b]))
         edges_data = [G.get_edge_data(u, v) for (u, v) in boundary]
         label = [data["jumpkind"] + " " + data.get("syscall_name", "") for data in edges_data]
 
