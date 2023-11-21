@@ -36,55 +36,23 @@ def extract_scg(cfg: angr.analyses.cfg.CFGFast) -> networkx.DiGraph:
 
     # Point Syscall edges to the immediate next fallthrough node (if present)
     log.info(f"Redirecting syscall edges...")
-    for node in G.nodes():
-        edges = list(G.out_edges(node, data=True))
-        edge_count = len(edges)
-
-        for i in range(edge_count):
-            # Skip any non-syscall edges
-            (_, next_node, next_data) = edges[i]
-            # Check the edge type. Syscall edges must be redirected, Call edges should have their FakeRet clobbered
-            jumpkind = next_data["jumpkind"]
-            if jumpkind == "Ijk_Sys_syscall":
-                # Make sure we don't accidentally clobber more fakerets, done by changing the jumpkind
-                # Edit the jumpkind now to make sure we also edit syscalls with no remaining path
-                next_data["jumpkind"] = f"Syscall"
-                next_data["syscall_name"] = next_node.name
-
-                # We're at the end of this node's edges, there are no more fakerets
-                if i == edge_count - 1:
-                    continue
-
-                (_, fallthrough_node, fallthrough_data) = edges[i + 1]
-                if fallthrough_data["jumpkind"] != "Ijk_FakeRet":
-                    print(f"Non-fakeret edge found after syscall? {fallthrough_data}")
-                    continue
-
-                G.remove_edge(node, next_node)
-                networkx.set_edge_attributes(G, {
-                    (node, fallthrough_node): next_data
-                })
-            elif jumpkind == "Ijk_Call":
-                # Clobber the immediate next FakeRet if any exist
-                if i == edge_count - 1:
-                    continue
-
-                (_, fallthrough_node, fallthrough_data) = edges[i + 1]
-                if fallthrough_data["jumpkind"] != "Ijk_FakeRet":
-                    print(f"Non-fakeret edge found after call? {fallthrough_data}")
-                    continue
-
-                G.remove_edge(node, fallthrough_node)
+    redirect_syscall_edges(G)
+    log.info(f"Clobbering function call fakerets...")
+    clobber_call_fakeret_edges(G)
 
     # Build partitions of the CFG based on connected boring nodes
     log.info(f"Building partitions...")
     partitions = []
     covered = set()
+
+    entry_partition_discovered = False
+    project_entry = cfg.get_node(cfg.project.entry)
+
     for node in G.nodes():
         if node in covered:
             continue
         
-        # Find all nodes reachable from this node with boring edges
+        # Find all nodes reachable from this node
         queue: collections.deque[angr.analyses.cfg.CFGNode] = collections.deque([node])
         partition = set()
         while len(queue) > 0:
@@ -95,65 +63,129 @@ def extract_scg(cfg: angr.analyses.cfg.CFGFast) -> networkx.DiGraph:
             partition.add(n)
             covered.add(n)
 
-            for (_, v, data) in G.out_edges(n, data=True):
-                if data["jumpkind"] in ["Ijk_Boring", "Ijk_FakeRet"]:
-                    # Don't merge nodes if they're the destination of a syscall or a call return
-                    merge = True
-                    for (_, _, in_data) in G.in_edges(v, data=True):
-                        if in_data["jumpkind"] in ["Syscall", "Ijk_Ret"]:
-                            merge = False
-                            break
+            # Go through both outgoing and incoming edges to merge as many nodes as possible
+            edges = itertools.chain(
+                ((v, data) for (_, v, data) in  G.out_edges(n, data=True)),
+                ((v, data) for (v, _, data) in  G.in_edges(n, data=True)),
+            )
 
-                    if merge:
-                        queue.append(v)
+            for (v, data) in edges:
+                # Don't merge nodes if they're the source/destination of a syscall
+                merge = True
+
+                check_edges = itertools.chain(
+                    (data for (_, _, data) in  G.out_edges(v, data=True)),
+                    (data for (_, _, data) in  G.in_edges(v, data=True)),
+                )
+
+                for data in check_edges:
+                    if data["jumpkind"] == "Syscall":
+                        merge = False
+                        break
+
+                if merge:
+                    queue.append(v)
+        
+        if not entry_partition_discovered:
+            if project_entry in partition:
+                partitions.insert(0, partition)
+                entry_partition_discovered = True
+                continue
 
         partitions.append(partition)
 
-    # Freeze each set to make them hashable
+    # Then build the SCG
+    log.info(f"Building SCG...")
+    scg = networkx.DiGraph()
+
+    # Freeze each partition to make them hashable
     partitions = [frozenset(x) for x in partitions]
-    log.info(f"Partitions built, # of nodes expected in SCG: {len(partitions)}")
+    # And keep track of a node -> partition mapping
+    node_to_partition = {}
 
-    log.info(f"Building partition boundaries...")
-    # Cache each partition's connecting points to speed up quotient graph building
-    partition_boundaries = {}
-    for part in partitions:
-        boundary = []
+    # One node for each partition
+    for (i, part) in enumerate(partitions):
+        name = list(part)[0].name if len(part) == 1 else "Many"
+        scg.add_node(i, label=f"{i}: {name}")
+
         for node in part:
-            # boundary.append(node)
+            node_to_partition[node] = i
 
-            for (_, _, edge_data) in itertools.chain(G.in_edges(node, data=True), G.out_edges(node, data=True)):
-                if edge_data["jumpkind"] in ["Ijk_Call", "Ijk_Ret", "Syscall"]:
-                    boundary.append(node)
-                    break
+    covered = set()
+    for (i, part) in enumerate(partitions):
+        if i in covered:
+            continue
+        
+        covered.add(part)
 
-        partition_boundaries[part] = boundary
-    log.info(f"Partition boundaries ready")
-    
-    # Then build the SCG by using quotient graphs
-    log.info(f"Building SCG, this may take a while...")
-    def should_edge_exist(a, b):
-        node_boundary = networkx.node_boundary(G, partition_boundaries[a], partition_boundaries[b])
+        # Then look for outgoing edges to other nodes
+        for node in part:
+            for (_, out_node, out_edge_data) in G.out_edges(node, data=True):
+                if out_node in part:
+                    continue
 
-        return len(node_boundary) > 0
+                edge_name = out_edge_data.get("syscall_name", out_edge_data["jumpkind"])
+                scg.add_edge(
+                    i, node_to_partition[out_node],
+                    label = f"{edge_name}({node.name})",
+                    syscall_name = out_edge_data.get("syscall_name", None)
+                )
 
-    def edge_data(a, b):
-        boundary = list(networkx.edge_boundary(G, partition_boundaries[a], partition_boundaries[b]))
-        edges_data = [G.get_edge_data(u, v) for (u, v) in boundary]
-        label = [data["jumpkind"] + " " + data.get("syscall_name", "") for data in edges_data]
+    # Clean up any isolated nodes
+    for (i, _) in enumerate(partitions):
+        if scg.in_degree(i) == 0 and scg.out_degree(i) == 0:
+            scg.remove_node(i)
 
-        return {
-            "label": label,
-        }
-
-    scg = networkx.quotient_graph(
-        G,
-        partitions,
-        edge_relation=should_edge_exist,
-        edge_data=edge_data,
-        node_data=lambda partition: {
-            "label": list(partition)[0].name,
-        },
-    )
     log.info(f"SCG built, # of nodes: {len(scg.nodes())}. # of edges: {len(scg.edges())}")
 
     return scg
+
+def redirect_syscall_edges(G):
+    for node in G.nodes():
+        edges = list(G.out_edges(node, data=True))
+        edge_count = len(edges)
+
+        for i in range(edge_count):
+            (_, target_node, target_edge_data) = edges[i]
+
+            jumpkind = target_edge_data["jumpkind"]
+            if jumpkind == "Ijk_Sys_syscall":
+                # Make sure we don't accidentally clobber more fakerets, done by changing the jumpkind
+                # Edit the jumpkind now to make sure we also edit syscalls with no remaining path
+                target_edge_data["jumpkind"] = f"Syscall"
+                target_edge_data["syscall_name"] = target_node.name
+
+                # We're at the end of this node's edges, there are no more fakerets
+                if i == edge_count - 1:
+                    continue
+
+                (_, fallthrough_node, fallthrough_data) = edges[i + 1]
+                if fallthrough_data["jumpkind"] != "Ijk_FakeRet":
+                    print(f"Non-fakeret edge found after syscall? {fallthrough_data}")
+                    continue
+
+                G.remove_edge(node, target_node)
+                networkx.set_edge_attributes(G, {
+                    (node, fallthrough_node): target_edge_data
+                })
+
+def clobber_call_fakeret_edges(G):
+    for node in G.nodes():
+        edges = list(G.out_edges(node, data=True))
+        edge_count = len(edges)
+
+        for i in range(edge_count):
+            (_, _, target_edge_data) = edges[i]
+
+            jumpkind = target_edge_data["jumpkind"]
+            if jumpkind == "Ijk_Call":
+                # Clobber the immediate next FakeRet if one exists
+                if i == edge_count - 1:
+                    continue
+
+                (_, fallthrough_node, fallthrough_data) = edges[i + 1]
+                if fallthrough_data["jumpkind"] != "Ijk_FakeRet":
+                    print(f"Non-fakeret edge found after call? {fallthrough_data}")
+                    continue
+
+                G.remove_edge(node, fallthrough_node)
