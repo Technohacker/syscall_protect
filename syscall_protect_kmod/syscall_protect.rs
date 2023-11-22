@@ -7,6 +7,9 @@ use kernel::{
     task::Task,
 };
 
+use crate::state_machine::StateMachine;
+
+mod state_machine;
 mod syscall_names;
 
 module! {
@@ -43,21 +46,59 @@ impl kernel::Module for SyscallProtect {
 }
 
 impl SyscallProtect {
-    fn start_write(_buf: &[u8]) -> Option<Error> {
+    fn bytes_to_usize(buf: &[u8]) -> usize {
+        let mut num = [0u8; 8];
+        num.copy_from_slice(buf);
+
+        usize::from_le_bytes(num)
+    }
+
+    fn start_write(buf: &[u8]) -> Option<Error> {
         let current: &Task = kernel::current!();
 
         pr_info!("Enforcement requested for PID: {}", current.pid());
         // Policy file loaded here
 
-        current.register_seccomp_callback((), Self::scg_step);
+        let num_states = Self::bytes_to_usize(&buf[0..8]);
+        let mut state_machine = StateMachine::new(num_states);
+
+        // 1 usize for the number of states, 3 usizes for the src, edge, dest
+        let state_count = (buf.len() - 8) / (8 * 3);
+
+        for i in 0..state_count {
+            // first usize + (curr state * 3 * usize)
+            let byte_start = 8 + 24 * i;
+            let (src, edge, dest) = (
+                Self::bytes_to_usize(&buf[(byte_start + 0 * 8)..(byte_start + 1 * 8)]),
+                Self::bytes_to_usize(&buf[(byte_start + 1 * 8)..(byte_start + 2 * 8)]),
+                Self::bytes_to_usize(&buf[(byte_start + 2 * 8)..(byte_start + 3 * 8)]),
+            );
+
+            let res = state_machine.add_edge(src, edge, dest);
+            if let Err(error) = res {
+                pr_err!("Error adding state machine edge: {error}\n");
+                return Some(EINVAL);
+            }
+        }
+
+        current.register_seccomp_callback(state_machine, Self::scg_step);
 
         None
     }
 
-    fn scg_step(_ctx: &mut (), syscall_num: i32) -> bool {
-        syscall_names::print_syscall(syscall_num as u32);
+    fn scg_step(machine: &mut StateMachine, syscall_num: i32) -> bool {
+        let syscall_num = syscall_num as u32;
 
-        true
+        syscall_names::print_syscall(syscall_num);
+        if machine.is_active() {
+            machine.step(syscall_num)
+        } else {
+            if syscall_num == kernel::bindings::__NR_execve {
+                machine.activate();
+            }
+
+            true
+        }
     }
 }
 
