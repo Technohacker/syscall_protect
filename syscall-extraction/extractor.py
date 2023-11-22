@@ -45,9 +45,6 @@ def extract_scg(cfg: angr.analyses.cfg.CFGFast) -> networkx.DiGraph:
     partitions = []
     covered = set()
 
-    entry_partition_discovered = False
-    project_entry = cfg.get_node(cfg.project.entry)
-
     for node in G.nodes():
         if node in covered:
             continue
@@ -70,6 +67,9 @@ def extract_scg(cfg: angr.analyses.cfg.CFGFast) -> networkx.DiGraph:
             )
 
             for (v, data) in edges:
+                # Uncomment to allow function call epsilons
+                # if data["jumpkind"] in ["Ijk_Call", "Ijk_Ret"]:
+                #     continue
                 # Don't merge nodes if they're the source/destination of a syscall
                 merge = True
 
@@ -85,12 +85,6 @@ def extract_scg(cfg: angr.analyses.cfg.CFGFast) -> networkx.DiGraph:
 
                 if merge:
                     queue.append(v)
-        
-        if not entry_partition_discovered:
-            if project_entry in partition:
-                partitions.insert(0, partition)
-                entry_partition_discovered = True
-                continue
 
         partitions.append(partition)
 
@@ -104,20 +98,15 @@ def extract_scg(cfg: angr.analyses.cfg.CFGFast) -> networkx.DiGraph:
     node_to_partition = {}
 
     # One node for each partition
-    for (i, part) in enumerate(partitions):
+    for part in partitions:
         name = list(part)[0].name if len(part) == 1 else "Many"
-        scg.add_node(i, label=f"{i}: {name}")
+        scg.add_node(part, label=name)
 
         for node in part:
-            node_to_partition[node] = i
+            node_to_partition[node] = part
 
     covered = set()
-    for (i, part) in enumerate(partitions):
-        if i in covered:
-            continue
-        
-        covered.add(part)
-
+    for part in partitions:
         # Then look for outgoing edges to other nodes
         for node in part:
             for (_, out_node, out_edge_data) in G.out_edges(node, data=True):
@@ -126,15 +115,27 @@ def extract_scg(cfg: angr.analyses.cfg.CFGFast) -> networkx.DiGraph:
 
                 edge_name = out_edge_data.get("syscall_name", out_edge_data["jumpkind"])
                 scg.add_edge(
-                    i, node_to_partition[out_node],
+                    part, node_to_partition[out_node],
                     label = f"{edge_name}({node.name})",
                     syscall_name = out_edge_data.get("syscall_name", None)
                 )
 
     # Clean up any isolated nodes
-    for (i, _) in enumerate(partitions):
-        if scg.in_degree(i) == 0 and scg.out_degree(i) == 0:
-            scg.remove_node(i)
+    for part in partitions:
+        if scg.in_degree(part) == 0 and scg.out_degree(part) == 0:
+            scg.remove_node(part)
+
+    # Re-number all nodes for sequentiality. Project entry partition goes first
+    project_entry = cfg.get_node(cfg.project.entry)
+    nodes = list(scg.nodes)
+    project_entry_pos = nodes.index(node_to_partition[project_entry])
+    (nodes[0], nodes[project_entry_pos]) = (nodes[project_entry_pos], nodes[0])
+
+    networkx.relabel_nodes(
+        scg,
+        dict((part, pos) for (pos, part) in enumerate(nodes)),
+        copy=False
+    )
 
     log.info(f"SCG built, # of nodes: {len(scg.nodes())}. # of edges: {len(scg.edges())}")
 

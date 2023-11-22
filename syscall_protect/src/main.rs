@@ -16,7 +16,7 @@ fn main() -> Result<(), String> {
 
     let policy_path = args.next().expect("Missing policy path?");
     let policy = try_or_error(
-        fs::read_to_string(policy_path),
+        fs::read(policy_path),
         "Failed to read policy file",
     )?;
 
